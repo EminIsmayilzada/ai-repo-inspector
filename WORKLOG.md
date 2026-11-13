@@ -80,3 +80,70 @@ target — raises the severity of #3 above what was originally written.
   repro artifacts (`.repro-mcp.mjs`, `pwned.txt`, injected git-diff output
   file) were deleted after use; `git status --porcelain` in this repo is
   clean.
+
+## 2026-11-13 Re-ranking (Emin's call, after reviewing the confirmed list)
+
+- Decision: move **#7 into must-do**, right after the MCP fixes. Reason:
+  the `--base-ref "--output=x"` repro showed real git argument injection
+  (git silently wrote a file into the target repo instead of diffing),
+  not just a crash risk — and the fix is small (reject refs starting with
+  `-`, verify the ref with `git rev-parse --verify`, pass `--` before
+  paths/refs).
+- New order: **#1 → #4 → #12+#2 → #3 → #7**, then #5/#6/#8/#9 if time
+  allows. #10/#11 stay nice-to-have/known-limitations.
+- This supersedes the priority grouping I proposed after Step 1 (which
+  had kept #7 in the "if time allows" band with #5/#6/#8/#9).
+
+## 2026-11-13 Step 2: Fix #1 (validation failures)
+
+- Test first: added `test/validation.test.ts` (new file, `test/report.test.ts`
+  untouched) asserting a non-zero exit resolves with `status: "failed"`, an
+  `exitCode`, combined stdout+stderr, and that the next command still runs.
+  `npm run typecheck` passed; `npm test` failed with the exact crash from
+  the #1 repro (`Error: Command failed: ...`), i.e. failed for the right
+  reason. Stopped there per the TDD workflow and got Emin's go-ahead.
+- Fix in `src/validation.ts`: `runValidation` no longer `reject()`s on a
+  non-zero exit — it resolves `{ status: "failed", exitCode, output }`.
+  `output` is now `stdout` and `stderr` combined (`[stdout, stderr].filter
+  (Boolean).join("\n")`), fixing the `stdout || stderr` drop from #8 as a
+  side effect of touching this branch anyway. Added a `timeoutMs` parameter
+  (default 5 minutes, per Emin) and a larger `maxBuffer` (10 MB, up from
+  Node's 1 MB default) on the underlying `exec()` call. `ValidationResult`
+  gained an optional `exitCode?: number` field — existing callers/tests
+  unaffected.
+- Added a second test: a command with a 60s internal `setTimeout` given a
+  300ms `timeoutMs` resolves `status: "failed"` with a "timed out" message
+  instead of hanging.
+- **Known limitation found while verifying this (Windows-specific, logged
+  here rather than fixed — out of scope for #1):** `exec()`'s `timeout`
+  option kills only the immediate shell process. On Windows, `exec` runs
+  commands through `cmd.exe /d /s /c "<command>"`; when the timeout fires,
+  Node calls `.kill()` on that `cmd.exe` process only. Windows has no
+  POSIX-style process-group signal propagation, so a grandchild the shell
+  spawned (e.g. the `node -e ...` in the timeout test) is **not** killed
+  and keeps running until it finishes on its own. Observed directly: after
+  the timeout test, two orphaned `node.exe` processes were still alive
+  (checked with `tasklist`), and the temp directory they were still `cwd`'d
+  into could not be removed (`EPERM`) until they exited on their own ~60s
+  later. A correct fix is a tree-kill (`taskkill /pid <pid> /t /f` on
+  Windows, a negative-pid signal to a detached process group on POSIX) —
+  real but non-trivial additional scope, so it is **not implemented**.
+  The test's own cleanup was changed to a best-effort `try/catch` around
+  `rmSync` so this known limitation doesn't fail the test; the actual
+  behavior under test (status/message) is unaffected and still asserted.
+- **Separate newly-found issue (➕, not fixed, flagged for awareness):**
+  running the CI order (`npm run typecheck && npm run build && npm test`)
+  leaves `dist/` present when `vitest run` executes, and vitest has no
+  configured `exclude` for it, so every test file under `test/` runs
+  **twice** — once from source, once from the compiled copy under
+  `dist/test/`. This inflates the reported test/file counts (e.g. "2
+  failed | 2 passed (4)" for what is really 2 distinct tests) and doubles
+  the side effects of every test (relevant here: two orphaned processes
+  per run, not one). This is a consequence of #11 (no `rootDir`/`outDir`
+  separation) compounding with a missing vitest exclude — connected to
+  #11 but a distinct fix (a `vitest.config.ts` or `test.exclude`), so left
+  as-is pending Emin's call on whether to fix it now or list it as a known
+  limitation.
+- Verification: `npm run typecheck && npm run build && npm test` all
+  green after the fixes above (ignoring the double-run noise described
+  above, which affects test *counting*, not correctness).
