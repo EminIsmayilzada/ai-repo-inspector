@@ -147,3 +147,17 @@ target — raises the severity of #3 above what was originally written.
 - Verification: `npm run typecheck && npm run build && npm test` all
   green after the fixes above (ignoring the double-run noise described
   above, which affects test *counting*, not correctness).
+
+## 2026-11-13 Fix the dist-duplication finding (➕ from Step 2)
+
+- Decision (Emin's call): fix it now rather than leave it as a known
+  limitation — it's a one-file, minimal addition.
+- Added `vitest.config.ts`: `exclude: [...configDefaults.exclude,
+  "dist/**"]`, imported from `vitest/config`. Keeps vitest's own default
+  excludes (so nothing already filtered, e.g. `node_modules`, stops being
+  filtered) and adds only `dist/**`; `include` left untouched.
+- Command: `rm -rf dist && npm run typecheck && npm run build && npm test`
+  → all pass. `npm test` now reports `Test Files 2 passed (2)` / `Tests 3
+  passed (3)` — each test runs exactly once, matching the 2 real files
+  (`report.test.ts`, `validation.test.ts`) and 3 real tests. Confirms the
+  double-run from the previous entry is gone.
