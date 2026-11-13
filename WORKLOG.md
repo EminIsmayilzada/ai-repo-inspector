@@ -1,0 +1,82 @@
+# WORKLOG.md
+
+Running log of commands, decisions and outcomes. Format per PROJECT.md §5.
+
+## 2026-11-13 Step 0: Setup
+
+- Command: `npm install` → pass. 143 packages added. `npm audit` reports
+  15 vulnerabilities (6 moderate, 8 high, 1 critical) in transitive deps —
+  not actioned (no new/changed dependencies allowed without Emin's
+  approval, and this is pre-existing in the starter's lockfile).
+- Command: `npm run typecheck` → pass, no errors.
+- Command: `npm test` → pass, 1/1 (`test/report.test.ts`).
+- Created the demo fixture at `C:\Users\hp\projects\demo` (sibling of this
+  repo) exactly per PROJECT.md: `main` has `a.txt`; branch `feature` has
+  `git mv a.txt b.txt` + new `c.txt`, committed; plus an untracked
+  `untracked.txt`. Commits made with `-c user.name=demo -c
+  user.email=demo@example.com`, local to that repo only.
+- MCP SDK 1.29.0 import paths (context7 not available in this session;
+  read `node_modules/@modelcontextprotocol/sdk/package.json` exports +
+  `dist/esm` instead, per CLAUDE.md fallback):
+  - `McpServer` → `@modelcontextprotocol/sdk/server/mcp.js` (already used
+    in `src/mcp-server.ts`)
+  - `StdioServerTransport` → `@modelcontextprotocol/sdk/server/stdio.js`
+    (already used)
+  - `Client` → `@modelcontextprotocol/sdk/client/index.js`,
+    constructor `new Client({ name, version })`, `client.connect(transport)`,
+    `client.callTool({ name, arguments })`
+  - `InMemoryTransport` → `@modelcontextprotocol/sdk/inMemory.js`, static
+    `InMemoryTransport.createLinkedPair()` returns `[serverTransport,
+    clientTransport]`
+
+## 2026-11-13 Step 1: Investigate — reproduction results
+
+Platform note logged up front because it affected how #8 was reproduced:
+**validation commands run through whatever shell `node:child_process.exec`
+picks per OS** — `cmd.exe` on Windows (this machine), a POSIX shell (`sh`)
+on Linux/macOS/CI. `sleep 999`, `echo hi > pwned.txt` etc. from the original
+hypotheses are POSIX-only and don't work as literally written on Windows.
+Reproduced with Node one-liners instead (portable). **This shell dependency
+itself is worth a line in the README** — a validation command that passes
+in CI (Linux) may behave differently or not exist locally (Windows), and
+vice versa.
+
+| # | Hypothesis | Verdict | Evidence |
+|---|---|---|---|
+| 1 | `validation.ts`: non-zero exit rejects the promise, no report, status `failed` never produced | ✅ confirmed | `inspector review --repo ../demo --validate "exit 1"` → uncaught rejection, raw stack trace (`Error: Command failed: exit 1`) to stderr, `review-report.md` **not written at all**, exit code 1. |
+| 2 | `mcp-server.ts`: schema says `repo_path`, handler reads `input.repoPath` | ✅ confirmed — worse than hypothesized | Real `InMemoryTransport`+`Client` call with `{ repo_path: "../demo" }` (exact schema field) → `repositoryPath` resolves to `undefined`. Does **not** crash: `execFileSync(..., { cwd: undefined })` silently inherits the server process's own cwd, so git ran against **this repo** instead of the target, returning an empty, misleading `# Review Report: undefined` with no changed files and no error. A caller doing exactly what the schema says gets silent wrong-repo output, not a visible failure. |
+| 3 | `mcp-server.ts`: agent-supplied `validationCommands` run through a shell, unrestricted | ✅ confirmed | Same in-memory call with `validationCommands: ["node -e \"require('fs').writeFileSync('pwned.txt','pwned')\""]` → command executed, no allow-list check anywhere. Because of #2's cwd bug, the file landed in **this repo's own root** (`pwned.txt`, created and verified, then deleted). Confirms both "no restriction" and that the blast radius is the server's own filesystem, not just the intended target repo. |
+| 4 | `cli.ts`: `--repo` cut at first space; missing flag values unreported | ✅ confirmed, with one correction | `--repo "../my demo"` → parsed path truncated to `../my` (confirmed indirectly: both this and a deliberately nonexistent `--repo ../nonexistent-dir-xyz` produce the identical low-level `spawnSync git ENOENT` from a nonexistent `cwd`, a Windows-specific symptom of a bad path, not a clear "path not found" message). Missing value for `--validate` (flag is last arg) → uncaught `TypeError [ERR_INVALID_ARG_TYPE]` raw stack trace, process crashes. Unknown flags (e.g. `--unknown-flag somevalue`) are silently dropped with **no error at all**, run continues normally. **Correction to the original hypothesis:** a missing value for `--repo` itself is *already* handled — `!args.repositoryPath` triggers the usage message + exit 1, so that specific case is not a bug; the real gaps are missing-value crashes on other flags (`--validate`, `--base-ref`) and silently-ignored unknown flags. |
+| 5 | `git.ts`: renames become "modified" with joined paths | ✅ confirmed | Review across `main...feature` (which has `git mv a.txt b.txt`) → report line `- a.txt\tb.txt (modified)` (literal tab character joining both paths, status `modified` not `renamed`). |
+| 6 | `git.ts`: uncommitted/untracked changes ignored, `untracked` status never produced | ✅ confirmed | Demo repo has `untracked.txt` present (`git status --porcelain` → `?? untracked.txt`) throughout every run above; it never once appears in any `markdownReport` output. |
+| 7 | `git.ts`: base hard-coded to `main`; unknown ref throws raw stack trace; ref starting with `-` passed to git as an option | ✅ confirmed, with a sharper finding | `--base-ref nope` → raw `status: 128` object dumped to stderr with full git stderr text, not a clean message. `--base-ref "--output=x"` → **no error at all**; git parsed `--output=x...HEAD` as its own `--output` flag and silently wrote a file literally named `x...HEAD` inside the target repo instead of diffing (verified: file existed, deleted after). This is git argument injection via an unvalidated `--base-ref`, not just a crash risk. |
+| 8 | `validation.ts`: no timeout; default 1 MB maxBuffer; stderr dropped when stdout non-empty | ✅ confirmed (all three parts; Windows-adapted repro per Emin's correction — `cmd.exe`, not `sh`) | No timeout: `--validate "node -e \"setTimeout(()=>{}, 600000)\""` was still running after a 20s wait (moved to background, manually killed — see Decision below) — nothing bounds it short of the full 600s. MaxBuffer: `--validate "node -e \"process.stdout.write('x'.repeat(2000000))\""` → raw `RangeError [ERR_CHILD_PROCESS_STDIO_MAXBUFFER]` stack trace, process crashes, no report. Stderr dropped: `--validate "node -e \"console.log('out'); console.error('err')\""` → report shows only `out`, `err` never appears (`output: stdout \|\| stderr` discards stderr whenever stdout is non-empty). |
+| 9 | `report.ts`: no pass/fail shown; output containing ` ``` ` breaks the fence; no size cap; no summary | ✅ confirmed (pass/fail, broken fence, no summary — directly observed; size cap not separately tested, no evidence found either way) | Every report above has no "passed"/"failed" marker per command and no top summary, just `# Review Report: <path>` → file list → raw validation dumps. A validation command that prints `` ``` `` (`node -e "console.log(String.fromCharCode(96,96,96)+' injected')"`) produced ```` ``` `` ` injected ```` inside the report — the inner triple-backtick closes the outer fence early, breaking the Markdown structure for everything after it. |
+| 10 | `cli.ts`/`core.ts`: `--format json` accepted but ignored; invalid format not rejected | ✅ confirmed | `--format json` produces byte-identical Markdown output to no `--format` at all. `--format totally-invalid-format` is **also** silently accepted (writes the same Markdown report, no validation error) — the field is parsed but never read by `core.ts`/`report.ts` at all. |
+| 11 | `package.json`: `bin` → `dist/cli.js`, but `rootDir: "."` makes `tsc` write `dist/src/cli.js` | ✅ confirmed | `npm run build` → `dist/` contains `dist/src/*.js` and `dist/test/`; `dist/cli.js` does **not exist**. The published `bin` entry would 404 on install. |
+| 12 | `mcp-server.ts`: top-level `await server.connect(...)` makes the module impossible to import in tests | ✅ confirmed | `mcp-server.ts` has **zero exports** — nothing to attach a second (in-memory) transport to even if import succeeded. Importing it with no stdio piped in (`node ... < /dev/null`) does not throw, but the process never exits on its own: running it under `timeout 5` killed it after 5s (exit 124); the stdio transport keeps the event loop alive waiting for input forever. Any test runner that imports this module as-is hangs until force-killed. |
+
+**No hypothesis was rejected.** All 12 reproduced. One hypothesis (#4) is
+partially corrected above (missing `--repo` value is already handled).
+Two hypotheses (#2, #3) turned out to compound: because of #2's `cwd:
+undefined` fallback, #3's unrestricted command execution lands in the
+**server's own working directory**, not just the caller's intended
+target — raises the severity of #3 above what was originally written.
+
+- Decision: for the #8 no-timeout repro, used the Bash tool's own 20s
+  timeout rather than letting the Node process run the full 600s, then
+  killed the backgrounded task explicitly — sufficient to prove "it does
+  not stop on its own," no need to burn the full 10 minutes.
+- Decision: reproduced #2/#3 by re-registering the exact same tool
+  schema/handler code from `mcp-server.ts` in a throwaway script
+  (`.repro-mcp.mjs`, deleted after use, never committed) wired to a real
+  `InMemoryTransport`/`Client` pair, instead of importing `mcp-server.ts`
+  directly — confirmed separately (hypothesis #12) that a direct import
+  hangs the process and exposes no `server` to attach a second transport
+  to, so this was the only way to exercise the real handler logic through
+  the real SDK without spawning a process (which CLAUDE.md rules out for
+  MCP tests).
+- No code in `src/` or `test/` was changed in this phase. All throwaway
+  repro artifacts (`.repro-mcp.mjs`, `pwned.txt`, injected git-diff output
+  file) were deleted after use; `git status --porcelain` in this repo is
+  clean.
