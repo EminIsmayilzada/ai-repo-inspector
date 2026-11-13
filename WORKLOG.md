@@ -161,3 +161,74 @@ target — raises the severity of #3 above what was originally written.
   passed (3)` — each test runs exactly once, matching the 2 real files
   (`report.test.ts`, `validation.test.ts`) and 3 real tests. Confirms the
   double-run from the previous entry is gone.
+
+## 2026-11-13 Step 3: Fix #4 (CLI) — failing tests (red step)
+
+- `src/cli.ts` has no exports and self-runs `main()` against the real
+  `process.argv` as an import side effect (same shape of problem as #12's
+  MCP module), so a test can't import it directly without either running
+  it against the test runner's own argv or refactoring first. To write
+  failing tests *before* touching `src/cli.ts`, `test/cli.test.ts` spawns
+  the real CLI as a subprocess instead: `node <tsx's dist/cli.mjs>
+  src/cli.ts <args>` via `spawnSync` with an argv array (no shell — the
+  same array-args discipline that fixes #4's own space-truncation bug
+  applies to the test harness invoking it). Each test uses a real temp git
+  repo fixture (`mkdtempSync` + `git init -b main` + one commit, per the
+  project's testing convention).
+- Five tests added, covering exactly the five sub-problems Emin listed.
+  `npm run typecheck` passes. `npm test` → all 5 fail, each for the
+  expected reason:
+  1. **Space truncation**: `--repo` pointing at a directory with a space
+     in its name → expected exit `0`, got `1` (today: path cut at the
+     space, `changedFiles` gets a nonexistent cwd, crashes).
+  2. **Missing `--validate` value**: expected stderr not to contain
+     `"TypeError"` and to contain `"Usage:"` → got the raw
+     `TypeError [ERR_INVALID_ARG_TYPE]` stack trace from #4's original
+     repro, no usage message at all.
+  3. **Unknown flag**: expected exit `1` and no `review-report.md`
+     written → got exit `0` and a report written (flag silently ignored).
+  4. **Invalid `--format` value** (`xml`): expected exit `1` → got exit
+     `0` (value silently ignored, markdown written anyway).
+  5. **Exit codes**: a failing `--validate` command → expected exit `2`
+     with the report still written → got exit `0` (no exit-code logic
+     tied to validation results exists yet).
+- Design note flagged for Emin, not yet decided: Emin's ask says "--format
+  validation", not "implement JSON output". Current plan for the fix step
+  is to validate `--format` against `"markdown" | "json"` literally (reject
+  anything else), and since real JSON serialization isn't being built now,
+  have `--format json` itself exit 1 with "not supported yet" rather than
+  silently falling back to markdown — matching PROJECT.md Step 3's explicit
+  fallback ("implement JSON output only if quick, otherwise error clearly
+  that it isn't supported yet"). No test pins this exact "json" message
+  down yet since it wasn't in Emin's explicit list; only the invalid-value
+  rejection (test 4 above) is tested.
+- Stopped here per the TDD workflow; no changes made to `src/cli.ts` in
+  this entry.
+
+## 2026-11-13 Step 3: Fix #4 (CLI) — implementation
+
+- Decision confirmed by Emin: `--format json` exits 1 with a clear "not
+  supported yet" message. Added a sixth, one-line test asserting exit `1`
+  and stderr containing "not supported yet" for `--format json`.
+- `src/cli.ts`: `parseArgs` now keeps the whole `--repo` value (no more
+  `.split(" ")[0]`), throws a `UsageError` for any unrecognized flag and
+  for any recognized flag missing its value, and validates `--format`
+  against a `value is Format` type guard (rejects anything other than
+  `"markdown"`/`"json"`). `main()` now returns a numeric exit code instead
+  of mutating `process.exitCode` inline: usage/parse errors and an
+  unimplemented `--format json` return `1` before any work happens; after
+  a successful review, it returns `2` if any validation result has
+  `status: "failed"`, else `0`. All error paths print `error.message`
+  (or a plain usage line) only — no stack traces.
+- `src/core.ts`: added `reviewRepositoryData(request): Promise<{
+  changedFiles, validationResults }>`, the structured-data step the CLI
+  needs to compute exit codes without parsing the rendered report text.
+  `reviewRepository` (existing export, contract-protected) is now a thin
+  wrapper — `reviewRepositoryData` + `markdownReport` — with its own
+  signature and string output unchanged for the same input. `cli.ts` calls
+  `reviewRepositoryData` directly and formats with `markdownReport` itself,
+  matching CLAUDE.md's "cli.ts... call core.ts, format output" and "core
+  returns structured data" architecture notes.
+- Verification: `npm run typecheck && npm run build && npm test` → all
+  green, `Test Files 3 passed (3)` / `Tests 9 passed (9)` (each test runs
+  once, per the earlier vitest-exclude fix).
