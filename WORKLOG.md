@@ -232,3 +232,30 @@ target — raises the severity of #3 above what was originally written.
 - Verification: `npm run typecheck && npm run build && npm test` → all
   green, `Test Files 3 passed (3)` / `Tests 9 passed (9)` (each test runs
   once, per the earlier vitest-exclude fix).
+
+## 2026-11-13 Step 6 (timeboxed): Fix #7 (git argument injection) in src/git.ts
+
+- Test first: new file `test/git.test.ts` (real temp git repo fixture,
+  `git init -b main` + one commit, per project convention) with two
+  tests:
+  1. `changedFiles(dir, "--output=x")` must throw, and no file
+     `x...HEAD` (the exact injected filename from the original #7 repro)
+     may exist afterward.
+  2. `changedFiles(dir, "nope")` must throw an error matching
+     `/unknown base ref/i`.
+  `npm run typecheck` passed. `npm test` → both failed for the right
+  reason: test 1 didn't throw at all (today, `--output=x...HEAD` is
+  still passed straight to `git diff` as an option, which silently wrote
+  the file instead of raising anything); test 2 threw the raw
+  `execFileSync` failure (`"Command failed: git diff --name-status
+  nope...HEAD\nfatal: ambiguous argument..."`), not a "unknown base ref"
+  message.
+- Fix in `src/git.ts`: added `verifyRef(repositoryPath, ref)`, called
+  before building the diff command. It throws immediately if `ref`
+  starts with `"-"` (never reaches git at all), otherwise runs `git
+  rev-parse --verify --quiet <ref>^{commit}` and throws a clear "Unknown
+  base ref" error if that fails. `changedFiles` also now passes `"--"`
+  to `git diff` after the `<base>...HEAD` range, per PROJECT.md Step 6,
+  so the range is always explicitly separated from pathspecs.
+- Verification: `npm run typecheck && npm run build && npm test` → all
+  green, `Test Files 4 passed (4)` / `Tests 11 passed (11)`.
