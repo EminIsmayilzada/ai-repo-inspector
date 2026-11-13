@@ -40,7 +40,7 @@ Every fix went red → green. I read each diff before committing.
 - `npm run typecheck && npm run build && npm test`: passes, 4 files, 11 tests, each run once.
 - `npm run inspector -- review --repo ../demo --validate "node -e ..."`: a passing command exits 0. A failing one exits 2, the report is still written, and stderr is captured.
 - Each fix's test was shown failing before the change (full log in WORKLOG.md).
-- GitHub Actions on the final push: [green / fill in]
+- GitHub Actions on the final push: [ GitHub Actions "Public checks" (npm ci → typecheck → build → test): passed on every pushed commit, including the final SUBMISSION.md commit.]
 
 ## A blocker you hit and how you approached it
 On Windows, the timeout kills cmd.exe but not the process it started, so a timed-out command keeps running until it finishes. A proper fix needs a process-tree kill, so I documented it as a limitation instead of expanding scope. I also found a false positive in my own guard hook: it read `2>&1` in `npm install 2>&1` as a package name.
